@@ -1,0 +1,374 @@
+"""
+Lead Data Collection & Organization Automation
+Collects NGO/nonprofit leads from public sources, cleans data,
+generates emails, and exports to a formatted Excel file.
+"""
+
+import re
+import time
+import random
+import logging
+import requests
+import pandas as pd
+from datetime import datetime
+from bs4 import BeautifulSoup
+from openpyxl import load_workbook
+from openpyxl.styles import (
+    Font, PatternFill, Alignment, Border, Side
+)
+from openpyxl.utils import get_column_letter
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+log = logging.getLogger(__name__)
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
+
+# ---------------------------------------------------------------------------
+# 1. SEED DATA — curated public NGO/nonprofit directory entries
+#    (Supplemented with scraping from a public list below)
+# ---------------------------------------------------------------------------
+
+SEED_LEADS = [
+    {"name": "Doctors Without Borders", "website": "https://www.msf.org",
+     "location": "Geneva, Switzerland", "sector": "Healthcare"},
+    {"name": "CARE International", "website": "https://www.care-international.org",
+     "location": "Geneva, Switzerland", "sector": "Humanitarian Aid"},
+    {"name": "Oxfam International", "website": "https://www.oxfam.org",
+     "location": "Oxford, UK", "sector": "Poverty Alleviation"},
+    {"name": "Save the Children", "website": "https://www.savethechildren.net",
+     "location": "London, UK", "sector": "Child Welfare"},
+    {"name": "World Wildlife Fund", "website": "https://www.worldwildlife.org",
+     "location": "Washington DC, USA", "sector": "Environment"},
+    {"name": "Amnesty International", "website": "https://www.amnesty.org",
+     "location": "London, UK", "sector": "Human Rights"},
+    {"name": "Human Rights Watch", "website": "https://www.hrw.org",
+     "location": "New York, USA", "sector": "Human Rights"},
+    {"name": "International Rescue Committee", "website": "https://www.rescue.org",
+     "location": "New York, USA", "sector": "Refugee Aid"},
+    {"name": "Plan International", "website": "https://plan-international.org",
+     "location": "Woking, UK", "sector": "Child Rights"},
+    {"name": "ActionAid International", "website": "https://www.actionaid.org",
+     "location": "Johannesburg, South Africa", "sector": "Poverty Alleviation"},
+    {"name": "Water.org", "website": "https://water.org",
+     "location": "Kansas City, USA", "sector": "Water & Sanitation"},
+    {"name": "Habitat for Humanity", "website": "https://www.habitat.org",
+     "location": "Atlanta, USA", "sector": "Housing"},
+    {"name": "World Food Programme", "website": "https://www.wfp.org",
+     "location": "Rome, Italy", "sector": "Food Security"},
+    {"name": "UNICEF", "website": "https://www.unicef.org",
+     "location": "New York, USA", "sector": "Child Welfare"},
+    {"name": "UNHCR", "website": "https://www.unhcr.org",
+     "location": "Geneva, Switzerland", "sector": "Refugee Aid"},
+    {"name": "Greenpeace International", "website": "https://www.greenpeace.org",
+     "location": "Amsterdam, Netherlands", "sector": "Environment"},
+    {"name": "Transparency International", "website": "https://www.transparency.org",
+     "location": "Berlin, Germany", "sector": "Anti-Corruption"},
+    {"name": "Mercy Corps", "website": "https://www.mercycorps.org",
+     "location": "Portland, USA", "sector": "Humanitarian Aid"},
+    {"name": "PATH", "website": "https://www.path.org",
+     "location": "Seattle, USA", "sector": "Global Health"},
+    {"name": "Direct Relief", "website": "https://www.directrelief.org",
+     "location": "Santa Barbara, USA", "sector": "Healthcare"},
+    {"name": "Helen Keller International", "website": "https://www.hki.org",
+     "location": "New York, USA", "sector": "Disability & Health"},
+    {"name": "Global Fund for Women", "website": "https://www.globalfundforwomen.org",
+     "location": "San Francisco, USA", "sector": "Gender Equality"},
+    {"name": "Room to Read", "website": "https://www.roomtoread.org",
+     "location": "San Francisco, USA", "sector": "Education"},
+    {"name": "Teach For All", "website": "https://teachforall.org",
+     "location": "New York, USA", "sector": "Education"},
+    {"name": "ChildFund International", "website": "https://www.childfund.org",
+     "location": "Richmond, USA", "sector": "Child Welfare"},
+]
+
+
+# ---------------------------------------------------------------------------
+# 2. SCRAPER — pull additional NGOs from a public Wikipedia list
+# ---------------------------------------------------------------------------
+
+def scrape_wikipedia_ngos(url: str, limit: int = 10) -> list[dict]:
+    """Scrape NGO names and websites from Wikipedia list pages."""
+    leads = []
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        table = soup.find("table", {"class": "wikitable"})
+        if not table:
+            log.warning("No wikitable found at %s", url)
+            return leads
+        rows = table.find_all("tr")[1:]
+        for row in rows[:limit]:
+            cols = row.find_all(["td", "th"])
+            if not cols:
+                continue
+            name = cols[0].get_text(strip=True)
+            website = ""
+            location = cols[1].get_text(strip=True) if len(cols) > 1 else ""
+            # look for external link
+            link = cols[0].find("a", href=True)
+            if link and link["href"].startswith("http"):
+                website = link["href"]
+            leads.append({
+                "name": name,
+                "website": website,
+                "location": location,
+                "sector": "NGO",
+            })
+            time.sleep(random.uniform(0.2, 0.5))
+    except Exception as exc:
+        log.warning("Scraping failed: %s", exc)
+    return leads
+
+
+# ---------------------------------------------------------------------------
+# 3. EMAIL GENERATION (bonus feature)
+# ---------------------------------------------------------------------------
+
+def generate_email(name: str, website: str) -> str:
+    """Generate a probable contact email from org name and domain."""
+    domain = ""
+    if website:
+        match = re.search(r"https?://(?:www\.)?([^/]+)", website)
+        if match:
+            domain = match.group(1)
+    if not domain:
+        return ""
+    # Normalise org name → slug
+    slug = re.sub(r"[^a-z0-9]", "", name.lower())[:12]
+    return f"info@{domain}"
+
+
+# ---------------------------------------------------------------------------
+# 4. DATA CLEANING
+# ---------------------------------------------------------------------------
+
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove duplicates, normalise text, fill missing values."""
+    # Map possible display names → internal names
+    col_map = {c: c for c in df.columns}
+    col_map.update({
+        "Organization Name": "name",
+        "Email": "email",
+        "Website": "website",
+        "Location": "location",
+        "Sector": "sector",
+        "LinkedIn": "linkedin",
+    })
+    # Reverse: find internal name for each column
+    def _col(alias: str) -> str:
+        for c in df.columns:
+            if c == alias or col_map.get(c) == alias:
+                return c
+        return alias
+
+    name_col    = _col("name")
+    website_col = _col("website")
+
+    if name_col in df.columns:
+        df = df.drop_duplicates(subset=[name_col], keep="first")
+    if website_col in df.columns:
+        df = df[~((df[website_col].isin(["", "N/A"])) & df.duplicated())]
+        df = df.drop_duplicates(subset=[website_col], keep="first")
+
+    # Normalise text columns
+    for col in [name_col, _col("location"), _col("sector")]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+    if name_col in df.columns:
+        df[name_col] = df[name_col].str.title()
+    if _col("sector") in df.columns:
+        df[_col("sector")] = df[_col("sector")].str.title()
+    if website_col in df.columns:
+        df[website_col] = df[website_col].astype(str).str.strip().str.lower()
+
+    # Fill missing values
+    for alias, default in [("website","N/A"),("location","Unknown"),
+                            ("sector","General"),("email","N/A"),("linkedin","N/A")]:
+        c = _col(alias)
+        if c in df.columns:
+            df[c] = df[c].replace({"": default, "nan": default})
+
+    df = df.reset_index(drop=True)
+    df.index += 1
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 5. EXCEL EXPORT with full formatting
+# ---------------------------------------------------------------------------
+
+def export_to_excel(df: pd.DataFrame, path: str) -> None:
+    """Write cleaned leads to a formatted Excel workbook."""
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Leads", index=True, index_label="S.No")
+        df.describe(include="all").to_excel(writer, sheet_name="Summary")
+
+    wb = load_workbook(path)
+
+    # ── Leads sheet formatting ──
+    ws = wb["Leads"]
+
+    DARK_TEAL  = "1B4F72"
+    LIGHT_TEAL = "D6EAF8"
+    ALT_ROW    = "EBF5FB"
+    WHITE      = "FFFFFF"
+    ACCENT     = "2E86C1"
+
+    header_font  = Font(name="Arial", bold=True, color=WHITE, size=11)
+    header_fill  = PatternFill("solid", start_color=DARK_TEAL)
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    thin = Side(style="thin", color="B0BEC5")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # Style header row
+    for cell in ws[1]:
+        cell.font   = header_font
+        cell.fill   = header_fill
+        cell.alignment = header_align
+        cell.border = border
+
+    ws.row_dimensions[1].height = 30
+
+    # Alternating row fills + borders
+    for i, row in enumerate(ws.iter_rows(min_row=2), start=2):
+        fill_color = ALT_ROW if i % 2 == 0 else WHITE
+        fill = PatternFill("solid", start_color=fill_color)
+        for cell in row:
+            cell.fill   = fill
+            cell.border = border
+            cell.font   = Font(name="Arial", size=10)
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+        ws.row_dimensions[i].height = 18
+
+    # Column widths
+    col_widths = {"A": 7, "B": 30, "C": 32, "D": 22, "E": 14, "F": 28, "G": 30}
+    for col, width in col_widths.items():
+        ws.column_dimensions[col].width = width
+
+    # Freeze header row
+    ws.freeze_panes = "A2"
+
+    # Add auto-filter
+    ws.auto_filter.ref = ws.dimensions
+
+    # ── Summary sheet formatting ──
+    ws2 = wb["Summary"]
+    for cell in ws2[1]:
+        cell.font = Font(name="Arial", bold=True, color=WHITE, size=10)
+        cell.fill = PatternFill("solid", start_color=ACCENT)
+        cell.alignment = Alignment(horizontal="center")
+    for col in ws2.columns:
+        ws2.column_dimensions[get_column_letter(col[0].column)].width = 18
+
+    # ── Stats sheet ──
+    ws3 = wb.create_sheet("Stats")
+    ws3["A1"] = "Lead Collection Report"
+    ws3["A1"].font = Font(name="Arial", bold=True, size=14, color=DARK_TEAL)
+    ws3["A3"] = "Generated on"
+    ws3["B3"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    ws3["A4"] = "Total Leads"
+    ws3["B4"] = f"=COUNTA(Leads!B2:B1000)"
+    ws3["A5"] = "Unique Sectors"
+    sector_col = "Sector" if "Sector" in df.columns else "sector"
+    ws3["B5"] = len(df[sector_col].unique())
+    ws3["A6"] = "Leads with Email"
+    ws3["B6"] = f'=COUNTIF(Leads!F2:F1000,"<>N/A")'
+    ws3["A7"] = "Leads with Website"
+    ws3["B7"] = f'=COUNTIF(Leads!D2:D1000,"<>N/A")'
+
+    for row in ws3.iter_rows(min_row=3, max_row=7, min_col=1, max_col=2):
+        for cell in row:
+            cell.font = Font(name="Arial", size=10)
+            cell.border = border
+        row[0].font = Font(name="Arial", bold=True, size=10)
+
+    ws3.column_dimensions["A"].width = 22
+    ws3.column_dimensions["B"].width = 22
+
+    wb.save(path)
+    log.info("Saved workbook → %s", path)
+
+
+# ---------------------------------------------------------------------------
+# 6. SCHEDULED RUN STUB (bonus)
+# ---------------------------------------------------------------------------
+
+def schedule_info() -> str:
+    return (
+        "\n[BONUS] To schedule this script daily, add to cron:\n"
+        "  0 8 * * * /usr/bin/python3 /path/to/lead_collector.py\n"
+        "Or use Windows Task Scheduler / GitHub Actions for cloud runs.\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. MAIN PIPELINE
+# ---------------------------------------------------------------------------
+
+def main():
+    log.info("=== Lead Data Collection Started ===")
+
+    # Collect seed data
+    leads = list(SEED_LEADS)
+
+    # Scrape additional entries from Wikipedia
+    log.info("Scraping additional NGOs from Wikipedia…")
+    wiki_url = (
+        "https://en.wikipedia.org/wiki/"
+        "List_of_international_non-governmental_organizations"
+    )
+    scraped = scrape_wikipedia_ngos(wiki_url, limit=8)
+    if scraped:
+        log.info("Scraped %d additional entries", len(scraped))
+        leads.extend(scraped)
+    else:
+        log.info("Wikipedia scrape returned no results; using seed data only.")
+
+    # Build DataFrame
+    df = pd.DataFrame(leads)
+
+    # Ensure all required columns exist
+    for col in ["name", "website", "location", "sector"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    # Generate emails (bonus feature)
+    df["email"] = df.apply(
+        lambda r: generate_email(r["name"], r["website"]), axis=1
+    )
+
+    # Add LinkedIn placeholder (would require API for real data)
+    df["linkedin"] = df["name"].apply(
+        lambda n: f"https://www.linkedin.com/company/"
+                  + re.sub(r"[^a-z0-9-]", "-", n.lower()).strip("-")
+    )
+
+    # Clean (before renaming columns)
+    log.info("Raw entries: %d", len(df))
+    df = clean_dataframe(df)
+
+    # Reorder and rename columns
+    df = df[["name", "email", "website", "location", "sector", "linkedin"]]
+    df.columns = ["Organization Name", "Email", "Website",
+                  "Location", "Sector", "LinkedIn"]
+    log.info("After cleaning: %d", len(df))
+
+    # Export
+    out_path = "/mnt/user-data/outputs/leads_output.xlsx"
+    export_to_excel(df, out_path)
+
+    print(f"\n✅ Done! {len(df)} leads saved to: {out_path}")
+    print(schedule_info())
+    return df
+
+
+if __name__ == "__main__":
+    main()
